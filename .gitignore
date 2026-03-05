@@ -1,0 +1,13 @@
+# ignore data and artifacts
+dataset/
+folds/
+results/
+src/weights/*
+
+# environment/editor
+.vscode/
+__pycache__/
+*.pyc
+
+# ignore weights
+yolo*.pt
