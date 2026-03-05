@@ -1,4 +1,4 @@
-name: pintado_yolov26
+name: compara_yolo_torch
 channels:
   - pytorch
   - nvidia

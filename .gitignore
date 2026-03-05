@@ -1,7 +1,7 @@
 # ignore data and artifacts
-dataset/
-folds/
-results/
+dataset/*
+folds/*
+results/*
 src/weights/*
 
 # environment/editor

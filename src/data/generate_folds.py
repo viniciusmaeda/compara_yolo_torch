@@ -3,43 +3,32 @@ from sklearn.model_selection import KFold
 import os
 import yaml
 
+# ==========================
+# EXPERIMENT CONFIG
+# ==========================
+
 # Resolve project root from this file: src/data/generate_folds.py -> project root.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Dataset source directories.
-DATASET_DIR = os.getenv("DATASET_DIR", os.path.join(PROJECT_ROOT, "dataset"))
+DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")
 IMAGES_DIR = os.path.join(DATASET_DIR, "train", "images")
 LABELS_DIR = os.path.join(DATASET_DIR, "train", "labels")
-DATASET_YAML = os.getenv("DATASET_YAML", os.path.join(DATASET_DIR, "data.yaml"))
+DATASET_YAML = os.path.join(DATASET_DIR, "data.yaml")
 
 # Output directory for generated K-Fold splits.
-FOLDS_DIR = os.getenv("FOLDS_DIR", os.path.join(PROJECT_ROOT, "folds"))
+FOLDS_DIR = os.path.join(PROJECT_ROOT, "folds")
 
 # K-Fold configuration.
-K = int(os.getenv("K_FOLDS", "5"))
-RANDOM_STATE = int(os.getenv("K_FOLD_SEED", "42"))
+K = 5
+RANDOM_STATE = 42
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 
 def load_class_config() -> tuple[int, list[str]]:
-    """Load class count and names from dataset YAML, with optional env overrides."""
-    env_names = os.getenv("CLASS_NAMES")
-    env_nc = os.getenv("NC")
-
-    if env_names:
-        names = [name.strip() for name in env_names.split(",") if name.strip()]
-        if not names:
-            raise ValueError("CLASS_NAMES was provided but no valid names were parsed.")
-        nc = int(env_nc) if env_nc is not None else len(names)
-        if nc != len(names):
-            raise ValueError(f"NC ({nc}) must match number of CLASS_NAMES ({len(names)}).")
-        return nc, names
-
+    """Load class count and names from dataset/data.yaml."""
     if not os.path.isfile(DATASET_YAML):
-        raise FileNotFoundError(
-            f"Dataset YAML not found: {DATASET_YAML}. "
-            "Create it or set CLASS_NAMES/NC via environment variables."
-        )
+        raise FileNotFoundError(f"Dataset YAML not found: {DATASET_YAML}.")
 
     with open(DATASET_YAML, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
