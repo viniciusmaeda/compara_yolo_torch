@@ -1,10 +1,12 @@
 import os
 import re
-from typing import Dict, List, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import torch
 
 # Resolve project paths from this file location: src/eval/analyze_results.py.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -166,6 +168,159 @@ def compute_summary_tables(per_fold_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.
     return summary_df, ranking_df, stability_df
 
 
+def infer_imgsz_from_run_csv(run_dir: str, default: int = 640) -> int:
+    """Infer training image size from one run results.csv if available."""
+    csv_path = os.path.join(run_dir, "results.csv")
+    if not os.path.isfile(csv_path):
+        return default
+
+    try:
+        df = pd.read_csv(csv_path, nrows=1)
+    except Exception:
+        return default
+
+    for candidate in ("imgsz", "train/imgsz"):
+        if candidate in df.columns:
+            try:
+                value = int(df.iloc[0][candidate])
+                if value > 0:
+                    return value
+            except Exception:
+                pass
+    return default
+
+
+def pick_checkpoint_path(model_runs: List[str]) -> Optional[str]:
+    """Pick one checkpoint path from model runs with preference for best.pt then last.pt."""
+    for run_dir in model_runs:
+        best_path = os.path.join(run_dir, "weights", "best.pt")
+        last_path = os.path.join(run_dir, "weights", "last.pt")
+        if os.path.isfile(best_path):
+            return best_path
+        if os.path.isfile(last_path):
+            return last_path
+    return None
+
+
+def count_model_params(pt_model: torch.nn.Module) -> int:
+    """Return number of parameters in a PyTorch model."""
+    return int(sum(p.numel() for p in pt_model.parameters()))
+
+
+def get_model_run_map(runs: List[Tuple[int, str, str]]) -> Dict[str, List[str]]:
+    """Return model -> list of run directories sorted by fold."""
+    model_to_runs: Dict[str, List[Tuple[int, str]]] = {}
+    for fold, model, run_dir in runs:
+        model_to_runs.setdefault(model, []).append((fold, run_dir))
+
+    out: Dict[str, List[str]] = {}
+    for model, fold_runs in model_to_runs.items():
+        fold_runs_sorted = sorted(fold_runs, key=lambda x: x[0])
+        out[model] = [run_dir for _, run_dir in fold_runs_sorted]
+    return out
+
+
+def measure_fps(pt_model: torch.nn.Module, imgsz: int, device: torch.device, warmup_iters: int = 10, timed_iters: int = 50) -> float:
+    """Measure model FPS with dummy tensor inference."""
+    pt_model.eval()
+    input_tensor = torch.randn(1, 3, imgsz, imgsz, device=device)
+
+    with torch.no_grad():
+        for _ in range(warmup_iters):
+            _ = pt_model(input_tensor)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device=device)
+
+        start = time.perf_counter()
+        for _ in range(timed_iters):
+            _ = pt_model(input_tensor)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device=device)
+
+        elapsed = time.perf_counter() - start
+
+    if elapsed <= 0:
+        return np.nan
+    return float(timed_iters / elapsed)
+
+
+def extract_flops_in_g(pt_model: torch.nn.Module, imgsz: int) -> float:
+    """Compute FLOPs using ultralytics.utils.torch_utils.get_flops and return GFLOPs."""
+    from ultralytics.utils.torch_utils import get_flops
+
+    try:
+        flops = get_flops(pt_model, imgsz=imgsz)
+    except TypeError:
+        try:
+            flops = get_flops(pt_model, imgsz)
+        except TypeError:
+            flops = get_flops(pt_model)
+
+    if flops is None:
+        return np.nan
+
+    flops_value = float(flops)
+    # Ultralytics typically reports raw FLOPs, so convert to GFLOPs for readability.
+    if flops_value > 1e6:
+        return flops_value / 1e9
+    return flops_value
+
+
+def compute_efficiency_metrics(runs: List[Tuple[int, str, str]]) -> pd.DataFrame:
+    """Compute params, FLOPs, and FPS for each discovered model using one trained checkpoint."""
+    try:
+        from ultralytics import YOLO
+    except Exception as exc:
+        print(f"Warning: Ultralytics import failed; skipping efficiency metrics. ({exc})")
+        return pd.DataFrame(columns=["model", "params", "flops_g", "fps"])
+
+    model_runs = get_model_run_map(runs)
+    if not model_runs:
+        return pd.DataFrame(columns=["model", "params", "flops_g", "fps"])
+
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    rows = []
+
+    for model in sorted(model_runs.keys(), key=model_order_key):
+        run_dirs = model_runs[model]
+        checkpoint = pick_checkpoint_path(run_dirs)
+        if checkpoint is None:
+            print(f"Warning: no checkpoint found for model '{model}', skipping efficiency metrics.")
+            continue
+
+        imgsz = infer_imgsz_from_run_csv(run_dirs[0], default=640)
+        print(f"Computing efficiency metrics for {model} using {os.path.basename(checkpoint)} (imgsz={imgsz}, device={device.type})...")
+
+        try:
+            yolo_model = YOLO(checkpoint)
+            pt_model = yolo_model.model.to(device)
+
+            params = count_model_params(pt_model)
+            flops_g = extract_flops_in_g(pt_model, imgsz=imgsz)
+            fps = measure_fps(pt_model, imgsz=imgsz, device=device)
+
+            rows.append({"model": model, "params": params, "flops_g": flops_g, "fps": fps})
+        except Exception as exc:
+            print(f"Warning: failed to compute efficiency for model '{model}'. ({exc})")
+        finally:
+            if "pt_model" in locals():
+                del pt_model
+            if "yolo_model" in locals():
+                del yolo_model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    eff_df = pd.DataFrame(rows)
+    if eff_df.empty:
+        return pd.DataFrame(columns=["model", "params", "flops_g", "fps"])
+
+    eff_df["_model_order"] = eff_df["model"].map(model_order_key)
+    eff_df = eff_df.sort_values(["_model_order", "model"]).drop(columns=["_model_order"]).reset_index(drop=True)
+    return eff_df
+
+
 def save_tables(per_fold_df: pd.DataFrame, summary_df: pd.DataFrame, ranking_df: pd.DataFrame, stability_df: pd.DataFrame) -> None:
     """Persist generated analysis tables to CSV files."""
     os.makedirs(ANALYSIS_DIR, exist_ok=True)
@@ -176,6 +331,12 @@ def save_tables(per_fold_df: pd.DataFrame, summary_df: pd.DataFrame, ranking_df:
     summary_df.to_csv(os.path.join(ANALYSIS_DIR, "model_summary.csv"), index=False)
     ranking_df.to_csv(os.path.join(ANALYSIS_DIR, "model_ranking.csv"), index=False)
     stability_df.to_csv(os.path.join(ANALYSIS_DIR, "stability_table.csv"), index=False)
+
+
+def save_efficiency_table(efficiency_df: pd.DataFrame) -> None:
+    """Persist model efficiency metrics."""
+    os.makedirs(ANALYSIS_DIR, exist_ok=True)
+    efficiency_df.to_csv(os.path.join(ANALYSIS_DIR, "model_efficiency.csv"), index=False)
 
 
 def plot_boxplots(per_fold_df: pd.DataFrame) -> None:
@@ -244,16 +405,20 @@ def plot_fold_model_heatmap(per_fold_df: pd.DataFrame) -> None:
 
 
 def plot_precision_recall_scatter(per_fold_df: pd.DataFrame) -> None:
-    """Create precision vs recall scatter with one color per model."""
+    """Create precision vs recall scatter using fold-mean point per model."""
     plt.figure(figsize=(7, 6))
 
-    for model in sorted(per_fold_df["model"].unique(), key=model_order_key):
-        model_df = per_fold_df[per_fold_df["model"] == model]
-        plt.scatter(model_df["recall"], model_df["precision"], label=model, s=45, alpha=0.8)
+    mean_df = per_fold_df.groupby("model", as_index=False)[["recall", "precision"]].mean()
+    mean_df["_model_order"] = mean_df["model"].map(model_order_key)
+    mean_df = mean_df.sort_values(["_model_order", "model"]).drop(columns=["_model_order"])
+
+    for _, row in mean_df.iterrows():
+        plt.scatter(row["recall"], row["precision"], label=row["model"], s=70, alpha=0.9)
+        plt.annotate(str(row["model"]), (row["recall"], row["precision"]), xytext=(6, 4), textcoords="offset points")
 
     plt.xlabel("Recall")
     plt.ylabel("Precision")
-    plt.title("Precision vs Recall by fold")
+    plt.title("Precision vs Recall (mean across folds)")
     plt.legend()
     plt.grid(alpha=0.25)
     plt.tight_layout()
@@ -305,6 +470,34 @@ def plot_training_curves(curves_by_model: Dict[str, List[pd.DataFrame]]) -> None
         plt.close()
 
 
+def plot_flops_vs_map(summary_df: pd.DataFrame) -> None:
+    """Create FLOPs vs mAP50-95 scatter plot from summary with efficiency columns."""
+    required = {"flops_g", "map50_95_mean", "model"}
+    if not required.issubset(summary_df.columns):
+        return
+
+    plot_df = summary_df.dropna(subset=["flops_g", "map50_95_mean"]).copy()
+    if plot_df.empty:
+        return
+
+    plot_df["_model_order"] = plot_df["model"].map(model_order_key)
+    plot_df = plot_df.sort_values(["_model_order", "model"]).drop(columns=["_model_order"])
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(plot_df["flops_g"], plot_df["map50_95_mean"], s=70, alpha=0.9)
+
+    for _, row in plot_df.iterrows():
+        plt.annotate(str(row["model"]), (row["flops_g"], row["map50_95_mean"]), xytext=(6, 4), textcoords="offset points")
+
+    plt.xlabel("GFLOPs")
+    plt.ylabel("mAP50-95 (mean)")
+    plt.title("Model efficiency: GFLOPs vs mAP50-95")
+    plt.grid(alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(os.path.join(ANALYSIS_DIR, "flops_vs_map50_95_scatter.png"), dpi=150)
+    plt.close()
+
+
 def main() -> None:
     os.makedirs(ANALYSIS_DIR, exist_ok=True)
 
@@ -318,7 +511,16 @@ def main() -> None:
         raise RuntimeError("No valid CSV data found after reading runs.")
 
     summary_df, ranking_df, stability_df = compute_summary_tables(per_fold_df)
+
+    efficiency_df = compute_efficiency_metrics(runs)
+    if not efficiency_df.empty:
+        summary_df = summary_df.merge(efficiency_df, on="model", how="left")
+    else:
+        for col in ("params", "flops_g", "fps"):
+            summary_df[col] = np.nan
+
     save_tables(per_fold_df, summary_df, ranking_df, stability_df)
+    save_efficiency_table(efficiency_df)
 
     plot_boxplots(per_fold_df)
     plot_mean_std_bars(summary_df)
@@ -326,6 +528,7 @@ def main() -> None:
     plot_precision_recall_scatter(per_fold_df)
     plot_ranking(summary_df)
     plot_training_curves(curves_by_model)
+    plot_flops_vs_map(summary_df)
 
     print("Analysis complete.")
     print(f"Tables and charts saved to: {ANALYSIS_DIR}")
@@ -334,6 +537,7 @@ def main() -> None:
     print("- model_summary.csv")
     print("- model_ranking.csv")
     print("- stability_table.csv")
+    print("- model_efficiency.csv")
 
 
 if __name__ == "__main__":

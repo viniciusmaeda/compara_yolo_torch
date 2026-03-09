@@ -1,7 +1,7 @@
 # Pipeline de Treinamento e Avaliação (YOLOv26 + K-Fold)
 
 Este projeto executa uma pipeline completa para:
-1. Gerar dobras de validação cruzada (K-Fold) no formato YOLO.
+1. Gerar dobras de validação cruzada (K-Fold) no formato COCO Json.
 2. Treinar múltiplos modelos YOLOv26 em cada dobra.
 3. Consolidar métricas e gerar gráficos comparativos.
 
@@ -9,10 +9,9 @@ Este projeto executa uma pipeline completa para:
 
 ```text
 dataset/
-  data.yaml
   train/
-    images/
-    labels/
+    _annotations.coco.json
+    <imagens>
 src/
   data/
     generate_folds.py
@@ -39,27 +38,21 @@ Obs. Se desejar criar um ambiente com outro nome, edite o arquivo `environment/e
 
 ## 1) Preparar dataset base
 
-O dataset deve estar em:
-- `dataset/train/images`
-- `dataset/train/labels`
+O dataset de entrada deve estar em COCO JSON:
+- `dataset/train/_annotations.coco.json`
+- `dataset/train/<imagens>`
 
-O arquivo `dataset/data.yaml` deve conter ao menos:
-- `nc`
-- `names`
-
-Exemplo:
-
-```yaml
-nc: 2
-names: ['classe_a', 'classe_b']
-```
+Nesse formato, o script:
+- lê `images`, `annotations` e `categories` do COCO;
+- converte as caixas para labels YOLO (`.txt`) por imagem;
+- gera os folds já prontos para treino com Ultralytics.
 
 ## 2) Gerar folds
 
 Script: `src/data/generate_folds.py`
 
 Esse script:
-- lê as imagens/labels do dataset base;
+- lê as imagens e anotações em COCO JSON do dataset base;
 - cria `folds/fold_1`, `folds/fold_2`, ... `folds/fold_K`;
 - gera `data.yaml` de cada dobra com `nc` e `names`.
 
@@ -72,7 +65,7 @@ python src/data/generate_folds.py
 
 ### Configuração no código
 
-Para definir o número de folds, abra o arquivo `src/data/generate_folds.py` e modefique as linhas abaixo:
+Para definir o número de folds, abra o arquivo `src/data/generate_folds.py` e modifique as linhas abaixo:
 - `K`
 - `RANDOM_STATE`
 
@@ -166,10 +159,10 @@ python src/eval/analyze_results.py
   Verifique se o treino terminou para todas as pastas em `results/`.
 
 - Erro de labels faltando:
-  Garanta que cada imagem em `dataset/train/images` tenha `.txt` correspondente em `dataset/train/labels`.
+  Verifique se `dataset/train/_annotations.coco.json` contém anotações válidas e se as imagens referenciadas em `images[].file_name` existem dentro de `dataset/train/`.
 
 - Erro de classe (`nc` vs `names`):
-  Ajuste `dataset/data.yaml` para manter consistência entre número de classes e nomes.
+  Verifique se `categories` no COCO está consistente (`id` e `name`).
 
 - Sem GPU:
   O treino usa CPU automaticamente quando CUDA não está disponível.
